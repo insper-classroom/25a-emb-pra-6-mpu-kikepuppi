@@ -5,6 +5,7 @@
 
 #include "pico/stdlib.h"
 #include <stdio.h>
+#include <math.h>
 
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
@@ -16,6 +17,12 @@
 const int MPU_ADDRESS = 0x68;
 const int I2C_SDA_GPIO = 4;
 const int I2C_SCL_GPIO = 5;
+
+QueueHandle_t xQueuePos;
+typedef struct {
+    int id;    // (0 = yaw, 1 = roll, 2 = click)
+    int dados; // Valor do dado
+} adc_t;
 
 static void mpu6050_reset() {
     // Two byte reset. First byte register, second byte data
@@ -60,7 +67,7 @@ static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp) {
 }
 
 void mpu6050_task(void *p) {
-    // configuracao do I2C
+
     i2c_init(i2c_default, 400 * 1000);
     gpio_set_function(I2C_SDA_GPIO, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_GPIO, GPIO_FUNC_I2C);
@@ -69,22 +76,96 @@ void mpu6050_task(void *p) {
 
     mpu6050_reset();
     int16_t acceleration[3], gyro[3], temp;
+    float acceleration_antiga = 0.0f, yaw = 0.0f, yaw_antigo = 0.0f, roll_antigo = 0.0f;
 
-    while(1) {
-        // leitura da MPU, sem fusao de dados
+    FusionAhrs ahrs;
+    FusionAhrsInitialise(&ahrs);
+
+    const float CLICK_BASE = 0.7f;
+
+    while (true) {
         mpu6050_read_raw(acceleration, gyro, &temp);
-        printf("Acc. X = %d, Y = %d, Z = %d\n", acceleration[0], acceleration[1], acceleration[2]);
-        printf("Gyro. X = %d, Y = %d, Z = %d\n", gyro[0], gyro[1], gyro[2]);
-        printf("Temp. = %f\n", (temp / 340.0) + 36.53);
 
+        FusionVector gyroscope = {
+            .axis.x = gyro[0] / 131.0f, // Conversão para graus/s
+            .axis.y = gyro[1] / 131.0f,
+            .axis.z = gyro[2] / 131.0f,
+        };
+
+        FusionVector accelerometer = {
+            .axis.x = acceleration[0] / 16384.0f, // Conversão para g
+            .axis.y = acceleration[1] / 16384.0f,
+            .axis.z = acceleration[2] / 16384.0f,
+        };
+
+        float acceleration_total = sqrt((accelerometer.axis.x * accelerometer.axis.x) + (accelerometer.axis.y * accelerometer.axis.y) + (accelerometer.axis.z * accelerometer.axis.z));
+
+        bool click = acceleration_total - acceleration_antiga > CLICK_BASE;
+
+        FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, SAMPLE_PERIOD);
+
+        const FusionEuler euler = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&ahrs));      
+
+        adc_t yaw_data = { 
+            .id = 0, 
+            .dados = (int)(euler.angle.yaw*-3) 
+        };
+        if (fabs(euler.angle.yaw - yaw_antigo) > 0.01) {xQueueSend(xQueuePos, &yaw_data, 1);}
+        yaw_antigo = euler.angle.yaw;
+
+        adc_t roll_data = { 
+            .id = 1, 
+            .dados = (int)(euler.angle.roll) 
+        };
+        if (fabs(euler.angle.roll - roll_antigo) > 0.01) {xQueueSend(xQueuePos, &roll_data, 1);}
+        roll_antigo = euler.angle.roll;
+
+        adc_t click_data = { 
+            .id = 2, 
+            .dados = click ? 1 : 0 
+        };
+        if (click) {xQueueSend(xQueuePos, &click_data, 1);}
+
+        acceleration_antiga = acceleration_total;
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+    }
+}
+
+void inicializar_hardware(void) {
+    stdio_init_all();
+    uart_init(uart_default, 115200);
+    gpio_set_function(0, GPIO_FUNC_UART);
+    gpio_set_function(1, GPIO_FUNC_UART);
+}
+
+void uart_task(void *parametros) {
+    adc_t dados_recebidos;
+
+    while (1) {
+        if (xQueueReceive(xQueuePos, &dados_recebidos, 100)) {
+            uint8_t byte_1 = ((uint16_t)dados_recebidos.dados) >> 8 & 0xFF;
+            uint8_t byte_0 = (uint8_t)dados_recebidos.dados & 0xFF;
+
+            uart_putc_raw(uart_default, dados_recebidos.id);
+            uart_putc_raw(uart_default, byte_0);
+            uart_putc_raw(uart_default, byte_1);
+            uart_putc_raw(uart_default, 0xFF);
+        }
+        
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 int main() {
-    stdio_init_all();
 
-    xTaskCreate(mpu6050_task, "mpu6050_Task 1", 8192, NULL, 1, NULL);
+    inicializar_hardware();
+
+    xQueuePos = xQueueCreate(3, sizeof(adc_t));
+
+    xTaskCreate(mpu6050_task, "mpu6050_Task", 8192, NULL, 1, NULL);
+    xTaskCreate(uart_task, "uart_Task", 4096, NULL, 1, NULL);
 
     vTaskStartScheduler();
 
