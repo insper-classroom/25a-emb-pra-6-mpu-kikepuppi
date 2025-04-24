@@ -76,12 +76,12 @@ void mpu6050_task(void *p) {
 
     mpu6050_reset();
     int16_t acceleration[3], gyro[3], temp;
-    float acceleration_antiga = 0.0f, yaw = 0.0f, yaw_antigo = 0.0f, roll_antigo = 0.0f;
+    float acceleration_antiga = 0.0f, yaw_antigo = 0.0f, roll_antigo = 0.0f, first_yaw = 0.0f;
 
     FusionAhrs ahrs;
     FusionAhrsInitialise(&ahrs);
 
-    const float CLICK_BASE = 0.7f;
+    const float CLICK_BASE = 0.6f;
 
     while (true) {
         mpu6050_read_raw(acceleration, gyro, &temp);
@@ -106,10 +106,16 @@ void mpu6050_task(void *p) {
 
         const FusionEuler euler = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&ahrs));      
 
+        if (yaw_antigo == 0) {
+            first_yaw = euler.angle.yaw;
+        }
+
         adc_t yaw_data = { 
             .id = 0, 
-            .dados = (int)(euler.angle.yaw*-3) 
+            .dados = (int)((euler.angle.yaw-first_yaw)*-3) 
         };
+
+
         if (fabs(euler.angle.yaw - yaw_antigo) > 0.01) {xQueueSend(xQueuePos, &yaw_data, 1);}
         yaw_antigo = euler.angle.yaw;
 
